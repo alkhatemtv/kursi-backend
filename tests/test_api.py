@@ -94,7 +94,8 @@ def test_users_me_creates_user_on_first_call(client):
 
 def test_protected_route_rejects_no_token(client):
     r = client.get("/users/me")
-    assert r.status_code == 403  # FastAPI HTTPBearer auto-error
+    # FastAPI HTTPBearer auto-error: was 403 in older versions, 401 in 0.118+.
+    assert r.status_code in (401, 403)
 
 
 def test_protected_route_rejects_bad_token(client):
