@@ -27,6 +27,7 @@ class User(Base):
 
     events: Mapped[list["Event"]] = relationship(back_populates="organizer", cascade="all, delete-orphan")
     bookings: Mapped[list["Booking"]] = relationship(back_populates="customer", cascade="all, delete-orphan")
+    wishlist: Mapped[list["Wishlist"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class Event(Base):
@@ -36,18 +37,27 @@ class Event(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     organizer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    name: Mapped[str] = mapped_column(String)
+    name: Mapped[str] = mapped_column(String, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    venue: Mapped[str | None] = mapped_column(String, nullable=True)
-    event_date: Mapped[str | None] = mapped_column(String, nullable=True)  # ISO string
+    venue: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    event_date: Mapped[str | None] = mapped_column(String, nullable=True, index=True)  # ISO string
     icon: Mapped[str] = mapped_column(String, default="🎫")
-    tag: Mapped[str] = mapped_column(String, default="Event")  # Theater | Cinema | Talk Show | Custom
+    tag: Mapped[str] = mapped_column(String, default="Event", index=True)  # Theater | Cinema | Talk Show | Custom
 
     # Seat builder data
     stage_w: Mapped[int] = mapped_column(Integer, default=1400)
     stage_h: Mapped[int] = mapped_column(Integer, default=900)
     seats: Mapped[list] = mapped_column(JSON, default=list)        # [{id,x,y,catId,row,col,label,blocked}]
     categories: Mapped[list] = mapped_column(JSON, default=list)   # [{id,name,price,color}]
+
+    # Detail-page metadata
+    performer: Mapped[str | None] = mapped_column(String, nullable=True)
+    gallery: Mapped[list] = mapped_column(JSON, default=list)      # ["https://...", ...]
+    duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Denormalised from `categories` so we can index/sort/filter by price in SQL
+    min_price: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    view_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
 
     status: Mapped[str] = mapped_column(String, default="draft")   # draft | active | inactive | scheduled
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -97,3 +107,16 @@ class Refund(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     booking: Mapped["Booking"] = relationship(back_populates="refunds")
+
+
+class Wishlist(Base):
+    """A user's saved-for-later events. Composite PK enforces one-row-per (user, event)."""
+
+    __tablename__ = "wishlist"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True, index=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), primary_key=True, index=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    user: Mapped["User"] = relationship(back_populates="wishlist")
+    event: Mapped["Event"] = relationship()

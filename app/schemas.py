@@ -1,5 +1,6 @@
 """Pydantic schemas — request bodies and response shapes."""
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -60,6 +61,9 @@ class EventBase(BaseModel):
     seats: list[SeatItem] = []
     categories: list[CategoryItem] = []
     status: str = "draft"
+    performer: str | None = None
+    gallery: list[str] = []
+    duration_minutes: int | None = None
 
 
 class EventCreate(EventBase):
@@ -78,6 +82,9 @@ class EventUpdate(BaseModel):
     seats: list[SeatItem] | None = None
     categories: list[CategoryItem] | None = None
     status: str | None = None
+    performer: str | None = None
+    gallery: list[str] | None = None
+    duration_minutes: int | None = None
 
 
 class EventOut(EventBase):
@@ -89,7 +96,53 @@ class EventOut(EventBase):
     capacity: int = 0
     sold_count: int = 0
     revenue: float = 0.0
+    view_count: int = 0
+    min_price: float | None = None
     model_config = ConfigDict(from_attributes=True)
+
+
+class PriceRange(BaseModel):
+    min: float | None = None
+    max: float | None = None
+
+
+class VenueInfo(BaseModel):
+    name: str | None = None
+
+
+class EventSummary(BaseModel):
+    """Compact event payload used for `related_events`."""
+    id: int
+    name: str
+    venue: str | None = None
+    event_date: str | None = None
+    tag: str
+    icon: str
+    min_price: float | None = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class EventDetailOut(EventOut):
+    """Extended event payload returned by GET /events/{id}."""
+    venue_info: VenueInfo
+    price_range: PriceRange
+    related_events: list[EventSummary] = []
+
+
+class EventListResponse(BaseModel):
+    events: list[EventOut]
+    total: int
+    page: int
+    per_page: int
+    total_pages: int
+
+
+class SortOption(str, Enum):
+    date_asc = "date_asc"
+    date_desc = "date_desc"
+    price_asc = "price_asc"
+    price_desc = "price_desc"
+    popularity = "popularity"
 
 
 # ── Bookings ────────────────────────────────────────────────
@@ -136,6 +189,18 @@ class RefundOut(BaseModel):
     status: str
     created_at: datetime
     processed_at: datetime | None = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ── Wishlist ────────────────────────────────────────────────
+class WishlistAdd(BaseModel):
+    event_id: int
+
+
+class WishlistItem(BaseModel):
+    event_id: int
+    added_at: datetime
+    event: EventSummary
     model_config = ConfigDict(from_attributes=True)
 
 

@@ -80,7 +80,12 @@ def test_health(client):
 def test_public_events_empty(client):
     r = client.get("/events")
     assert r.status_code == 200
-    assert r.json() == []
+    body = r.json()
+    assert body["events"] == []
+    assert body["total"] == 0
+    assert body["page"] == 1
+    assert body["per_page"] == 20
+    assert body["total_pages"] == 0
 
 
 # ── Auth ────────────────────────────────────────────────────
@@ -132,7 +137,9 @@ def test_create_and_list_event(client):
 
     # Should appear on the public list (status=active)
     r = client.get("/events")
-    assert len(r.json()) == 1
+    body = r.json()
+    assert body["total"] == 1
+    assert len(body["events"]) == 1
 
 
 def test_update_event_only_by_owner(client):
@@ -241,3 +248,176 @@ def test_full_booking_and_refund_flow(client):
         headers=auth_header(role="customer", sub="test|cust3"),
     )
     assert r.status_code == 201, "Seat should be available after refund"
+
+
+# ── Search / filter / sort / pagination ─────────────────────
+def _seed_catalog(client):
+    """Seed three active events with distinct dates / tags / prices for filter tests."""
+    events = [
+        {
+            "name": "Verdi Opera Night",
+            "venue": "Grand Hall",
+            "performer": "Soprano X",
+            "tag": "Theater",
+            "event_date": "2026-06-10",
+            "status": "active",
+            "categories": [{"id": "a", "name": "A", "price": 80, "color": "#000"}],
+            "seats": [{"id": "1", "x": 0, "y": 0, "catId": "a", "label": "A1"}],
+        },
+        {
+            "name": "Indie Film Marathon",
+            "venue": "Cinema One",
+            "performer": "Various",
+            "tag": "Cinema",
+            "event_date": "2026-07-05",
+            "status": "active",
+            "categories": [{"id": "a", "name": "A", "price": 20, "color": "#000"}],
+            "seats": [{"id": "1", "x": 0, "y": 0, "catId": "a", "label": "A1"}],
+        },
+        {
+            "name": "Shakespeare in the Park",
+            "venue": "Open Air Theatre",
+            "performer": "Royal Players",
+            "tag": "Theater",
+            "event_date": "2026-06-20",
+            "status": "active",
+            "categories": [{"id": "a", "name": "A", "price": 35, "color": "#000"}],
+            "seats": [{"id": "1", "x": 0, "y": 0, "catId": "a", "label": "A1"}],
+        },
+    ]
+    for payload in events:
+        r = client.post("/events", json=payload, headers=auth_header(role="organizer"))
+        assert r.status_code == 201, r.text
+
+
+def test_events_search_matches_name_venue_and_performer(client):
+    _seed_catalog(client)
+
+    r = client.get("/events?search=opera")
+    assert r.status_code == 200
+    names = [e["name"] for e in r.json()["events"]]
+    assert names == ["Verdi Opera Night"]
+
+    r = client.get("/events?search=cinema")  # matches venue "Cinema One"
+    assert [e["name"] for e in r.json()["events"]] == ["Indie Film Marathon"]
+
+    r = client.get("/events?search=royal")  # matches performer "Royal Players"
+    assert [e["name"] for e in r.json()["events"]] == ["Shakespeare in the Park"]
+
+
+def test_events_filter_by_category_and_sort_price_asc(client):
+    _seed_catalog(client)
+    r = client.get("/events?category=Theater&sort=price_asc")
+    assert r.status_code == 200
+    events = r.json()["events"]
+    assert [e["name"] for e in events] == [
+        "Shakespeare in the Park",  # 35
+        "Verdi Opera Night",        # 80
+    ]
+
+
+def test_events_filter_by_date_range(client):
+    _seed_catalog(client)
+    r = client.get("/events?date_from=2026-06-01&date_to=2026-06-30")
+    assert r.status_code == 200
+    names = sorted(e["name"] for e in r.json()["events"])
+    assert names == ["Shakespeare in the Park", "Verdi Opera Night"]
+
+
+def test_events_pagination(client):
+    _seed_catalog(client)
+    r = client.get("/events?page=1&per_page=2&sort=date_asc")
+    body = r.json()
+    assert body["total"] == 3
+    assert body["per_page"] == 2
+    assert body["total_pages"] == 2
+    assert len(body["events"]) == 2
+
+    r = client.get("/events?page=2&per_page=2&sort=date_asc")
+    assert len(r.json()["events"]) == 1
+
+
+def test_events_invalid_sort_returns_400_with_error_shape(client):
+    r = client.get("/events?sort=bogus")
+    assert r.status_code == 400
+    assert "error" in r.json()
+
+
+def test_events_per_page_over_max_returns_400(client):
+    r = client.get("/events?per_page=51")
+    assert r.status_code == 400
+    assert "error" in r.json()
+
+
+def test_events_invalid_date_returns_400(client):
+    r = client.get("/events?date_from=not-a-date")
+    assert r.status_code == 400
+    assert "error" in r.json()
+
+
+def test_events_no_match_returns_empty_list_not_404(client):
+    _seed_catalog(client)
+    r = client.get("/events?search=zzznonexistent")
+    assert r.status_code == 200
+    assert r.json()["total"] == 0
+    assert r.json()["events"] == []
+
+
+# ── Event detail ────────────────────────────────────────────
+def test_event_detail_returns_full_payload_and_increments_views(client):
+    _seed_catalog(client)
+    listing = client.get("/events?search=opera").json()["events"]
+    eid = listing[0]["id"]
+
+    r = client.get(f"/events/{eid}")
+    assert r.status_code == 200
+    assert r.headers.get("cache-control") == "public, max-age=300"
+    body = r.json()
+    assert body["name"] == "Verdi Opera Night"
+    assert body["venue_info"] == {"name": "Grand Hall"}
+    assert body["price_range"] == {"min": 80.0, "max": 80.0}
+    assert body["view_count"] == 1
+    # Same tag, different event → should appear in related
+    related_names = [e["name"] for e in body["related_events"]]
+    assert "Shakespeare in the Park" in related_names
+
+    # Second fetch increments view_count
+    r = client.get(f"/events/{eid}")
+    assert r.json()["view_count"] == 2
+
+
+def test_event_detail_404(client):
+    r = client.get("/events/9999")
+    assert r.status_code == 404
+
+
+# ── Wishlist ────────────────────────────────────────────────
+def test_wishlist_requires_auth(client):
+    r = client.get("/wishlist")
+    assert r.status_code in (401, 403)
+    r = client.post("/wishlist", json={"event_id": 1})
+    assert r.status_code in (401, 403)
+
+
+def test_wishlist_add_list_remove(client):
+    _seed_catalog(client)
+    eid = client.get("/events?search=opera").json()["events"][0]["id"]
+
+    r = client.post("/wishlist", json={"event_id": eid}, headers=auth_header(role="customer", sub="test|cust"))
+    assert r.status_code == 201, r.text
+    assert r.json()["event_id"] == eid
+
+    # Idempotent — adding the same event again doesn't error or duplicate.
+    r = client.post("/wishlist", json={"event_id": eid}, headers=auth_header(role="customer", sub="test|cust"))
+    assert r.status_code == 201
+
+    r = client.get("/wishlist", headers=auth_header(role="customer", sub="test|cust"))
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+    assert r.json()[0]["event"]["name"] == "Verdi Opera Night"
+
+    r = client.delete(f"/wishlist/{eid}", headers=auth_header(role="customer", sub="test|cust"))
+    assert r.status_code == 200
+
+    r = client.get("/wishlist", headers=auth_header(role="customer", sub="test|cust"))
+    assert r.json() == []
