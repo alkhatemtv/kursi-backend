@@ -10,7 +10,6 @@ from sqlalchemy import inspect, text
 from app.config import settings
 from app.database import Base, engine
 from app.routers import ai, bookings, events, refunds, users, wishlist
-from app import routes_admin
 from app.schemas import HealthResponse
 
 logger = logging.getLogger("kursi")
@@ -95,4 +94,3 @@ app.include_router(bookings.router)
 app.include_router(refunds.router)
 app.include_router(ai.router)
 app.include_router(wishlist.router)
-app.include_router(routes_admin.router)
