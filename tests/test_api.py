@@ -142,6 +142,39 @@ def test_create_and_list_event(client):
     assert len(body["events"]) == 1
 
 
+def test_created_event_without_status_is_publicly_listed(client):
+    """Regression: status defaulted to 'draft' while GET /events only listed
+    'active' events, so a newly created event never showed up publicly."""
+    r = client.post(
+        "/events",
+        json={"name": "No Status Given", "categories": [], "seats": []},
+        headers=auth_header(role="organizer"),
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["status"] == "active"
+
+    body = client.get("/events").json()
+    assert [e["name"] for e in body["events"]] == ["No Status Given"]
+
+
+def test_public_list_shows_coming_soon_but_hides_drafts(client):
+    for name, st in [("Live", "active"), ("Soon", "coming_soon"), ("Hidden", "draft")]:
+        r = client.post(
+            "/events",
+            json={"name": name, "status": st, "categories": [], "seats": []},
+            headers=auth_header(role="organizer"),
+        )
+        assert r.status_code == 201, r.text
+
+    body = client.get("/events").json()
+    assert sorted(e["name"] for e in body["events"]) == ["Live", "Soon"]
+    assert body["total"] == 2
+
+    # The organizer still sees everything, drafts included.
+    mine = client.get("/events/mine/list", headers=auth_header(role="organizer")).json()
+    assert sorted(e["name"] for e in mine) == ["Hidden", "Live", "Soon"]
+
+
 def test_update_event_only_by_owner(client):
     payload = {
         "name": "First", "status": "active",

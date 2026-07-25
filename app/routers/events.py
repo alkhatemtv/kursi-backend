@@ -1,12 +1,12 @@
 """Event CRUD routes.
 
 Public:
-  GET  /events                — list active events with search/filter/sort/paging
+  GET  /events                — list publicly visible events with search/filter/sort/paging
   GET  /events/{id}           — view a single event (increments view_count)
 
 Organizer-only:
   GET  /events/mine/list      — list MY events (any status)
-  POST /events                — create a new event (status defaults to 'draft')
+  POST /events                — create a new event (status defaults to 'active')
   PUT  /events/{id}           — update one of MY events
   DELETE /events/{id}         — delete one of MY events
 """
@@ -35,6 +35,11 @@ from app.schemas import (
 )
 
 router = APIRouter(prefix="/events", tags=["events"])
+
+# Statuses that belong in the public listing. 'coming_soon'/'scheduled' events
+# are shown but the frontend renders them with a disabled "Coming Soon" button;
+# 'draft' and 'inactive' stay hidden and are only visible via /events/mine/list.
+PUBLIC_STATUSES = ("active", "coming_soon", "scheduled")
 
 
 def _compute_min_price(categories: list | None) -> float | None:
@@ -131,7 +136,7 @@ def list_public_events(
         except ValueError:
             return _error(400, "Invalid date_to — expected YYYY-MM-DD")
 
-    q = db.query(Event).filter(Event.status == "active")
+    q = db.query(Event).filter(Event.status.in_(PUBLIC_STATUSES))
 
     if search:
         like = f"%{search.lower()}%"
@@ -201,7 +206,7 @@ def get_event(event_id: int, response: Response, db: Session = Depends(get_db)):
         .filter(
             Event.tag == event.tag,
             Event.id != event.id,
-            Event.status == "active",
+            Event.status.in_(PUBLIC_STATUSES),
         )
         .order_by(Event.view_count.desc(), Event.id.desc())
         .limit(3)

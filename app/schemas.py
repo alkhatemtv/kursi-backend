@@ -60,7 +60,10 @@ class EventBase(BaseModel):
     stage_h: int = 900
     seats: list[SeatItem] = []
     categories: list[CategoryItem] = []
-    status: str = "draft"
+    # New events are published by default — a draft is opt-in via status="draft".
+    # Previously this defaulted to "draft" while GET /events only listed "active"
+    # events, so anything created through the API silently never appeared.
+    status: str = "active"
     performer: str | None = None
     gallery: list[str] = []
     duration_minutes: int | None = None
