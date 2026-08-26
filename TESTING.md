@@ -113,6 +113,55 @@ Pre-existing suites `tests/test_api.py` (integration flows) and
 
 ---
 
+## Engine schema tests (Phase 1a)
+
+`tests/test_engine_schema.py` covers the DB-enforced invariants of the Kursi Engine
+schema — see [`docs/SCHEMA.md`](docs/SCHEMA.md).
+
+**These build their own database.** The invariants (two partial unique indexes and the
+layout freeze trigger) exist only in the Alembic migration; `create_all()` does not
+create triggers, and the legacy suites drop/recreate the shared schema between tests,
+which would remove them. So this module runs `alembic upgrade head` against a dedicated
+database and asserts against that — the invariants are tested exactly as production
+will have them.
+
+What runs where:
+
+| Test group | SQLite (default) | PostgreSQL |
+|---|---|---|
+| Migration up/down/up round-trip | runs | runs |
+| Exit test 4 — double-sell backstop | runs | runs |
+| Exit test 5 — frozen layout immutability | runs | runs |
+| Seat-lock uniqueness | runs | runs |
+| Exit test 6 — money shape | runs | runs |
+| `TestPostgresSpecificDDL` | **skipped, with reason** | runs |
+
+SQLite supports partial unique indexes *and* triggers, so the three invariants are
+genuinely enforced on both backends and nothing is silently skipped. Only the four
+tests that inspect PostgreSQL-specific artefacts — the plpgsql function, `pg_indexes`
+predicates, and `TEXT[]` — are gated, and they hard-skip with a visible reason rather
+than passing vacuously.
+
+### Running the PostgreSQL-gated tests
+
+They run automatically when `TEST_DATABASE_URL` points at a PostgreSQL database:
+
+```bash
+export TEST_DATABASE_URL=postgresql://user:pass@host:5432/kursi_scratch
+pytest tests/test_engine_schema.py
+```
+
+> The module runs `alembic downgrade base` then `upgrade head` on that URL, so it
+> **must** be a scratch database you are happy to have rebuilt. The guards in
+> `conftest.py` still refuse any live-looking host.
+
+**These are intended to run against the staging environment's database** once that
+environment exists (see the Railway dashboard actions in the Phase 0 report). Until
+then they skip locally by design — no local PostgreSQL or Docker is required or
+expected.
+
+---
+
 ## Notes
 
 - `httpx` is already a production dependency (the auth layer uses it for JWKS),
