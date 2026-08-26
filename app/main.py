@@ -9,6 +9,7 @@ from sqlalchemy import inspect, text
 
 from app.config import settings
 from app.database import Base, engine
+from app.migrations import check_migration_state, get_app_version, log_migration_state
 from app.routers import ai, bookings, events, refunds, users, wishlist
 from app.schemas import HealthResponse
 
@@ -52,6 +53,10 @@ async def lifespan(app: FastAPI):
     """Create database tables on startup. For real schema changes use Alembic."""
     Base.metadata.create_all(bind=engine)
     _migrate_sqlite_inplace()
+    # Safety check only - logs drift between the DB schema revision and the code's
+    # head revision. Never raises, never blocks startup. See app/migrations.py.
+    log_migration_state(engine)
+    logger.info("Starting Kursi API (env=%s, version=%s)", settings.environment, get_app_version())
     if not os.environ.get("ANTHROPIC_API_KEY"):
         # Logged once at startup. Other endpoints remain functional; the AI router
         # returns 503 per-request until the key is configured.
@@ -78,14 +83,30 @@ app.add_middleware(
 )
 
 
+def _health_payload() -> HealthResponse:
+    """Build the health payload. Always reports status 'ok' if the process can
+    answer at all - migration drift is surfaced via `migration_state`, not by
+    failing the check, so a lagging schema doesn't take the service out of a
+    load balancer."""
+    info = check_migration_state(engine)
+    return HealthResponse(
+        status="ok",
+        env=settings.environment,
+        version=get_app_version(),
+        db_revision=info["db_revision"],
+        head_revision=info["head_revision"],
+        migration_state=info["state"],
+    )
+
+
 @app.get("/", response_model=HealthResponse, tags=["meta"])
 def root():
-    return HealthResponse(status="ok", env=settings.app_env)
+    return _health_payload()
 
 
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
 def health():
-    return HealthResponse(status="ok", env=settings.app_env)
+    return _health_payload()
 
 
 app.include_router(users.router)

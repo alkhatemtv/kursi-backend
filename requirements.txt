@@ -9,3 +9,4 @@ fastapi>=0.118.0
    python-multipart>=0.0.20
    anthropic>=0.40.0,<1.0.0
 psycopg2-binary==2.9.10
+alembic==1.19.1

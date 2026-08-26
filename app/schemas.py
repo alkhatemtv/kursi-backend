@@ -213,5 +213,19 @@ class Message(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """Liveness + deployment identity.
+
+    `status` and `env` are unchanged from the original response; everything below
+    is additive and optional, so existing clients keep working untouched.
+    """
+
     status: str
     env: str
+    # Short commit sha of the running build, or "unknown".
+    version: str | None = None
+    # Alembic revision currently stamped in the database (None if never stamped).
+    db_revision: str | None = None
+    # Alembic revision this build of the code expects.
+    head_revision: str | None = None
+    # up_to_date | out_of_date | unknown
+    migration_state: str | None = None
