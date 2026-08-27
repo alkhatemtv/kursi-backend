@@ -94,10 +94,38 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import auth  # noqa: E402
+from app import engine_models as em  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.database import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Booking, Event, Refund, User, Wishlist  # noqa: E402
+
+# Engine tables, children first, for the per-test wipe below. Phase 1b made
+# `get_current_user` provision a personal organization, so every authenticated
+# request in the legacy suites now leaves Engine rows behind. They have to go
+# with the legacy rows: `engine_memberships.user_id` is an FK onto `users.id`
+# with ON DELETE RESTRICT, so deleting users while a membership survives would
+# fail outright on PostgreSQL - and on SQLite (FK enforcement off by default)
+# would silently leave a membership pointing at a recycled user id.
+_ENGINE_WIPE_ORDER = (
+    em.WebhookDelivery,
+    em.WebhookEndpoint,
+    em.AuditLog,
+    em.UsageEvent,
+    em.Ticket,
+    em.SeatLock,
+    em.Order,
+    em.PerformanceSeat,
+    em.PerformanceCategory,
+    em.Performance,
+    em.EngineEvent,
+    em.LayoutVersion,
+    em.VenueLayout,
+    em.Venue,
+    em.ApiKey,
+    em.Membership,
+    em.Organization,
+)
 
 # Final assertion: the app really did pick up the test URL.
 assert settings.database_url == os.environ["DATABASE_URL"], (
@@ -124,9 +152,13 @@ def _schema():
 def db():
     """A session against the test database, with all rows cleared first.
 
-    Deletion order respects the foreign keys (children before parents).
+    Deletion order respects the foreign keys (children before parents), and
+    covers the Engine tables as well as the legacy ones - see
+    `_ENGINE_WIPE_ORDER`.
     """
     session = SessionLocal()
+    for model in _ENGINE_WIPE_ORDER:
+        session.query(model).delete()
     for model in (Wishlist, Refund, Booking, Event, User):
         session.query(model).delete()
     session.commit()

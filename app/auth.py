@@ -7,7 +7,13 @@ How this works:
   4. We verify the JWT signature, expiration, audience, and issuer.
   5. We look up (or create) a local `User` row keyed by the Auth0 `sub` claim,
      so every authenticated request gives us a database user.
+  6. We make sure that user has somewhere to work: if they belong to no
+     organization yet, a personal one is provisioned for them (Engine spec 1).
+
+Step 6 is the only Engine-aware thing in this module, and it is deliberately
+non-fatal - see `get_current_user`.
 """
+import logging
 from functools import lru_cache
 from typing import Any
 
@@ -16,11 +22,15 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import jwt
 from jose.exceptions import ExpiredSignatureError, JWTClaimsError, JWTError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
+from app.engine_services.provisioning import ensure_personal_organization
 from app.models import User
+
+logger = logging.getLogger("kursi.auth")
 
 bearer_scheme = HTTPBearer(auto_error=True)
 
@@ -157,7 +167,38 @@ def get_current_user(
             db.commit()
             db.refresh(user)
 
+    _provision_organization(db, user)
+
     return user
+
+
+def _provision_organization(db: Session, user: User) -> None:
+    """Give a brand-new user a personal organization + owner membership.
+
+    Idempotent and concurrency-safe - see
+    `app.engine_services.provisioning.ensure_personal_organization`, which lets a
+    UNIQUE index pick the winner when two first requests race.
+
+    WHY FAILURES ARE SWALLOWED
+    --------------------------
+    The frozen marketplace authenticates through this dependency, and none of
+    its routes read an organization. Turning a provisioning problem - an Engine
+    migration not yet applied on some environment, say - into a 401/500 on every
+    legacy request would be trading a real outage for a bookkeeping gap. So a
+    database error is logged and the request proceeds with a valid `User`; the
+    next authenticated request will try again. Anything that is NOT a database
+    error still propagates, because that would be a bug in our own code.
+    """
+    try:
+        ensure_personal_organization(db, user)
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning(
+            "personal organization provisioning failed for user %s; the request "
+            "continues without one",
+            user.id,
+            exc_info=True,
+        )
 
 
 def require_organizer(user: User = Depends(get_current_user)) -> User:

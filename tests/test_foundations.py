@@ -9,11 +9,14 @@ Covered here:
   b) GET /events only exposes PUBLIC_STATUSES events
   c) GET /events/{id} returns seats + categories with the expected fields
   d) get_current_user auto-provisions a User row on first authenticated request
+  e) ...and, since Phase 1b, a personal organization + owner membership with it
 """
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
+from app import engine_models as em
 from app.models import Event, User
 from app.routers.events import PUBLIC_STATUSES
 from tests.conftest import auth_header
@@ -159,3 +162,77 @@ def test_health_reports_env_and_migration_fields(client):
     for field in ("version", "db_revision", "head_revision", "migration_state"):
         assert field in body
     assert body["migration_state"] in ("up_to_date", "out_of_date", "unknown")
+
+
+# ── e) Engine organization provisioning through the real auth path ──────────
+def test_first_authenticated_request_provisions_a_personal_organization(
+    client, db, fake_jwt
+):
+    """Spec 1: "on first authenticated request, auto-create user AND a personal
+    organization + owner membership if the user has none"."""
+    sub = "auth0|org-provisioning"
+    assert db.query(em.Organization).count() == 0
+
+    r = client.get("/users/me", headers=auth_header(sub=sub, email="dana@kursi.io"))
+    assert r.status_code == 200
+
+    db.expire_all()
+    user = db.query(User).filter(User.auth0_sub == sub).one()
+    org = db.execute(select(em.Organization)).scalar_one()
+    membership = db.execute(select(em.Membership)).scalar_one()
+
+    assert org.type == "personal"
+    assert org.slug == f"dana-{user.id}"
+    assert (membership.user_id, membership.organization_id) == (user.id, org.id)
+    assert (membership.role, membership.status) == ("owner", "active")
+
+
+def test_repeat_requests_do_not_provision_a_second_organization(client, db, fake_jwt):
+    sub = "auth0|org-idempotent"
+    for _ in range(3):
+        assert client.get("/users/me", headers=auth_header(sub=sub)).status_code == 200
+
+    db.expire_all()
+    assert db.query(em.Organization).count() == 1
+    assert db.query(em.Membership).count() == 1
+
+
+def test_two_users_each_get_their_own_organization(client, db, fake_jwt):
+    client.get("/users/me", headers=auth_header(sub="auth0|one", email="one@kursi.io"))
+    client.get("/users/me", headers=auth_header(sub="auth0|two", email="two@kursi.io"))
+
+    db.expire_all()
+    assert db.query(em.Organization).count() == 2
+    assert db.query(em.Membership).count() == 2
+
+
+def test_a_provisioning_failure_does_not_break_authentication(
+    client, db, fake_jwt, monkeypatch
+):
+    """The frozen marketplace must keep working even if the Engine side cannot.
+
+    A database error during provisioning is logged and swallowed; the request
+    still gets its `User`. Anything else would turn an Engine bookkeeping
+    problem into an outage on routes that never read an organization.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from app import auth as auth_module
+
+    def boom(*args, **kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("no such table"))
+
+    monkeypatch.setattr(auth_module, "ensure_personal_organization", boom)
+
+    r = client.get("/users/me", headers=auth_header(sub="auth0|resilient"))
+
+    assert r.status_code == 200
+    db.expire_all()
+    assert db.query(User).filter(User.auth0_sub == "auth0|resilient").count() == 1
+    assert db.query(em.Organization).count() == 0
+
+
+def test_legacy_public_routes_still_need_no_organization(client, seed):
+    """Control: the marketplace listing is untouched by any of the above."""
+    assert client.get("/events").status_code == 200
+    assert client.get(f"/events/{seed['event'].id}").status_code == 200

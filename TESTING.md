@@ -162,6 +162,66 @@ expected.
 
 ---
 
+## Engine service tests (Phase 1b)
+
+`tests/engine/` covers the domain services in `app/engine_services/` — provisioning,
+publishing, the locking engine and fulfilment. Like the Phase 1a schema tests, **the
+package builds its own database with `alembic upgrade head`**: the services lean on
+two partial unique indexes and the layout-freeze trigger, and `create_all()` does not
+create triggers.
+
+Two further harness details, both in `tests/engine/conftest.py`:
+
+- **A hand-driven clock is installed for every test** (`ManualClock`, autouse). Expiry
+  is timestamp truth, so tests move time instead of sleeping — and installing it
+  everywhere, not just in the expiry tests, means a service that read the wall clock
+  directly would fail here rather than only in production.
+- **SQLite runs with `BEGIN IMMEDIATE`, `busy_timeout` and `foreign_keys=ON`.** Without
+  the first two, two threads writing concurrently hit "database is locked" instead of
+  queueing; with them, concurrent writers serialise cleanly. This does *not* give SQLite
+  PostgreSQL's concurrency model, and the tests say so where it matters.
+
+What runs where:
+
+| Test group | SQLite (default) | PostgreSQL |
+|---|---|---|
+| Provisioning: idempotency, slugs, single-transaction | runs | runs |
+| Provisioning: 2 and 5 concurrent first requests (real threads) | runs | runs |
+| Publishing: freeze, 144-seat materialisation, republish idempotency | runs | runs |
+| Locking: all-or-nothing, conflict shapes, `external_ref` idempotency | runs | runs |
+| Exit test 1 — two threads, one seat, one winner | runs | runs |
+| Exit test 1 — loser **blocks on the index** mid-transaction | **skipped, with reason** | runs |
+| Exit test 2 — expiry without GC | runs | runs |
+| Exit test 3 — the single +4:00 | runs | runs |
+| Fulfilment: tickets, usage, cancel/refund, credentials | runs | runs |
+| Clock + unit of work | runs | runs |
+
+Exactly one test is gated. Two threads contending for one seat runs on both backends
+and proves the arbiter (the partial unique index picks the winner; the loser gets the
+structured conflict) — but on SQLite the two write transactions are *serialised*, so
+the loser meets an already-committed lock rather than blocking on the index. The
+interleaved case — the competing `INSERT` waiting inside the index until the winner
+commits — is genuinely inexpressible on SQLite and is therefore skipped there with a
+visible reason, not approximated with sequential calls.
+
+```bash
+export TEST_DATABASE_URL=postgresql://user:pass@host:5432/kursi_scratch
+pytest tests/engine
+```
+
+> The package runs `alembic downgrade base` then `upgrade head` on that URL, so it must
+> be a scratch database. The `conftest.py` guards still refuse any live-looking host.
+
+### The legacy suites now clear Engine tables too
+
+`get_current_user` provisions a personal organization, so every authenticated request in
+`test_api.py` / `test_foundations.py` leaves `engine_organizations` and
+`engine_memberships` rows behind. The `db` fixture wipes them alongside the legacy tables
+(`_ENGINE_WIPE_ORDER`) — `engine_memberships.user_id` is an FK onto `users.id` with
+`ON DELETE RESTRICT`, so leaving them would break the user wipe on PostgreSQL.
+
+---
+
 ## Notes
 
 - `httpx` is already a production dependency (the auth layer uses it for JWKS),

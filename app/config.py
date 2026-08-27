@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     # CORS — comma-separated origins
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
+    # Engine — HMAC key for ticket credential tokens (Decision 4).
+    # Empty is fine in development (a fixed dev key is used); in production the
+    # credential module refuses to sign with it. Rotating this invalidates every
+    # outstanding QR, so treat it like a signing key, not a password.
+    engine_credential_secret: str = ""
+
     # App
     # `ENV` is the canonical name (production | staging | development).
     # `APP_ENV` predates it and is still honoured so existing deployments that
