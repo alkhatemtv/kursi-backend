@@ -39,6 +39,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, event
+from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app import engine_models as em
@@ -102,11 +103,35 @@ def _alembic_config(url: str) -> Config:
 # ── Database ────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def engine_url(tmp_path_factory) -> str:
-    """A database at head, built by the real migration."""
+    """A database at head, built by the real migration.
+
+    ON SQLite the two suites do not collide: this package gets its own temp
+    file, and `tests/conftest.py` keeps its own.
+
+    ON PostgreSQL they share ONE database - `TEST_DATABASE_URL` is a single URL -
+    and they build a schema in two incompatible ways. `tests/conftest.py` calls
+    `Base.metadata.create_all()`; this package runs the Alembic migration. The
+    root conftest's session fixture runs first, so by the time this one starts,
+    `users` and every `engine_` table already exist with no `alembic_version` row
+    to show for it. `alembic downgrade base` then has nothing recorded to undo
+    and `upgrade head` walks straight into `relation "users" already exists`.
+
+    So on PostgreSQL the slate is wiped for real - schema and all - before the
+    migration runs. That makes this package's contract ("I own this database and
+    I build it with the migration") literally true rather than nearly true. The
+    root suite is not harmed: the baseline revision creates the legacy tables
+    it needs, identically to `create_all`, and every test wipes its own rows on
+    setup anyway.
+    """
     if IS_POSTGRES:
-        cfg = _alembic_config(_TEST_URL)
-        command.downgrade(cfg, "base")
-        command.upgrade(cfg, "head")
+        scratch = create_engine(_TEST_URL, future=True)
+        try:
+            with scratch.begin() as conn:
+                conn.execute(sa_text("DROP SCHEMA public CASCADE"))
+                conn.execute(sa_text("CREATE SCHEMA public"))
+        finally:
+            scratch.dispose()
+        command.upgrade(_alembic_config(_TEST_URL), "head")
         return _TEST_URL
 
     db_file = tmp_path_factory.mktemp("engine_services") / "engine.db"
@@ -117,7 +142,13 @@ def engine_url(tmp_path_factory) -> str:
 
 @pytest.fixture(scope="session")
 def db_engine(engine_url):
-    eng = create_engine(engine_url, future=True)
+    # `pool_pre_ping` matters only for the remote case: against the staging
+    # server every pooled connection crosses the public internet through a TCP
+    # proxy that is entitled to drop an idle one, and a connection that died
+    # between two tests would otherwise surface as a fixture ERROR that has
+    # nothing to do with the code under test. The ping costs one round trip on
+    # checkout and is free on SQLite, which never loses a connection.
+    eng = create_engine(engine_url, future=True, pool_pre_ping=True)
 
     if eng.dialect.name == "sqlite":
 
@@ -146,12 +177,28 @@ def session_factory(db_engine):
 
 
 @pytest.fixture(autouse=True)
-def clean_database(session_factory):
+def clean_database(session_factory, db_engine):
     """Empty every table before each test.
 
     These services COMMIT - that is the whole point of a durable hold - so
     rollback-per-test isolation is not available here. Wiping is.
+
+    On PostgreSQL that wipe is ONE statement rather than eighteen. It is the
+    same eighteen tables either way, but the suite is also run against the
+    staging server over a public TCP proxy, where every statement is a network
+    round trip: eighteen per test across the whole suite is thousands of
+    round trips spent deleting nothing. `TRUNCATE ... CASCADE` collapses them
+    into one and, unlike `DELETE`, does not have to scan each table first.
+    Identity sequences are deliberately NOT restarted, so ids keep behaving
+    exactly as they do under the per-table deletes SQLite still uses.
     """
+    if db_engine.dialect.name == "postgresql":
+        tables = ", ".join(m.__tablename__ for m in WIPE_ORDER)
+        with db_engine.begin() as conn:
+            conn.execute(sa_text(f"TRUNCATE TABLE {tables} CASCADE"))
+        yield
+        return
+
     cleaner = session_factory()
     try:
         for model in WIPE_ORDER:
@@ -279,3 +326,180 @@ def published(session, world):
     )
     session.commit()
     return world
+
+
+# ── /v1 API harness (Phase 1c) ──────────────────────────────────────────────
+# The route tests run against THIS database, not the one `tests/conftest.py`
+# builds. Two of the things /v1 must get right - the frozen-layout 409 and the
+# never-double-sell backstop - exist only in the Alembic migration, and
+# `Base.metadata.create_all()` creates neither. A route test on a `create_all`
+# database would be asserting against a schema production does not have.
+#
+# The seam is `app.database.get_db`: overriding it hands every request a session
+# from the same migrated engine the service fixtures use, which also means the
+# autouse `manual_clock` above governs route tests too - expiry is driven, not
+# waited for.
+
+#: Marker consumed by the patched `_decode_token`. Not a real JWT; nothing in
+#: this suite ever contacts Auth0.
+API_TOKEN_PREFIX = "FAKE."
+
+#: Every role in spec 1, each given its own user in `api_world`, so an
+#: authorisation test can name a role instead of constructing one.
+API_ROLE_SUBS = {role: f"test|role-{role}" for role in em.MEMBERSHIP_ROLES}
+
+
+def api_token(sub: str, email: str | None = None) -> str:
+    return f"{API_TOKEN_PREFIX}{sub}.organizer.{email or sub.replace('|', '_')}@kursi.io"
+
+
+def user_header(sub: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_token(sub)}"}
+
+
+def role_header(role: str) -> dict[str, str]:
+    return user_header(API_ROLE_SUBS[role])
+
+
+def key_header(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def api_client(session_factory, monkeypatch):
+    """A TestClient whose requests run against the migrated engine database."""
+    from fastapi import HTTPException
+    from fastapi.testclient import TestClient
+
+    from app import auth as app_auth
+    from app.database import get_db
+    from app.main import app
+
+    def _decode(token: str) -> dict:
+        if not token.startswith(API_TOKEN_PREFIX):
+            raise HTTPException(status_code=401, detail="Invalid token")
+        _, sub, role, email = token.split(".", 3)
+        return {
+            "sub": sub,
+            "email": email,
+            "https://kursi.io/role": role,
+            "https://kursi.io/name": sub,
+        }
+
+    monkeypatch.setattr(app_auth, "_decode_token", _decode)
+
+    def _override_get_db():
+        s = session_factory()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    previous = dict(app.dependency_overrides)
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
+
+
+@pytest.fixture
+def api_world(session, world):
+    """`world`, plus a user holding each spec-1 role in that organization, plus
+    a SECOND organization with its own owner for cross-tenant assertions.
+
+    Built in two flushes rather than one per row. On SQLite that is invisible;
+    against the staging PostgreSQL over a public proxy every flush is a network
+    round trip, and this fixture runs before every route test.
+    """
+    from app.models import User as LegacyUser
+
+    users = {
+        role: LegacyUser(
+            auth0_sub=sub,
+            email=f"{sub.replace('|', '_')}@kursi.io",
+            name=role,
+            role="organizer",
+        )
+        for role, sub in API_ROLE_SUBS.items()
+    }
+    # A member whose invitation was never accepted, and someone from elsewhere.
+    users["_invited"] = LegacyUser(
+        auth0_sub="test|invited", email="invited@kursi.io", name="Invited",
+        role="organizer",
+    )
+    users["_outsider"] = LegacyUser(
+        auth0_sub="test|outsider", email="outsider@rival.example",
+        name="Outsider", role="organizer",
+    )
+    other_org = em.Organization(name="Rival Ltd", slug="rival-ltd", type="business")
+    session.add_all([*users.values(), other_org])
+    session.flush()
+
+    memberships = [
+        em.Membership(
+            organization_id=world["org_id"], user_id=users[role].id,
+            role=role, status="active",
+        )
+        for role in API_ROLE_SUBS
+    ]
+    memberships.append(
+        # 'invited' authorises nothing - it is not an active membership.
+        em.Membership(
+            organization_id=world["org_id"], user_id=users["_invited"].id,
+            role="owner", status="invited",
+        )
+    )
+    memberships.append(
+        em.Membership(
+            organization_id=other_org.id, user_id=users["_outsider"].id,
+            role="owner", status="active",
+        )
+    )
+    session.add_all(memberships)
+    session.flush()
+
+    # Read the ids BEFORE committing. `expire_on_commit` is on, so touching
+    # `user.id` afterwards would issue a refresh - which on SQLite opens a fresh
+    # BEGIN IMMEDIATE that nothing then commits, and the first request to write
+    # would sit on that lock until `busy_timeout` gave up.
+    world.update({f"user_{role}": users[role].id for role in API_ROLE_SUBS})
+    world["user_invited"] = users["_invited"].id
+    world["user_outsider"] = users["_outsider"].id
+    world["other_org_id"] = other_org.id
+
+    session.commit()
+    return world
+
+
+@pytest.fixture
+def make_api_key(session):
+    """Mint a real API key row and hand back the token, as the endpoint would."""
+    from app.api import keys as api_keys
+
+    def _make(
+        organization_id: int,
+        *,
+        scopes: list[str] | None = None,
+        environment: str = "sandbox",
+        revoked: bool = False,
+        name: str = "test key",
+    ) -> str:
+        token, key_prefix, key_hash = api_keys.mint(environment)
+        row = em.ApiKey(
+            organization_id=organization_id,
+            name=name,
+            key_prefix=key_prefix,
+            key_hash=key_hash,
+            environment=environment,
+            scopes=api_keys.normalize_scopes(scopes or ["read"]),
+        )
+        if revoked:
+            row.revoked_at = T0
+        session.add(row)
+        session.commit()
+        return token
+
+    return _make

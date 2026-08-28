@@ -33,7 +33,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import BigInteger, Integer, create_engine, inspect, text
-from sqlalchemy.exc import DBAPIError, IntegrityError, StatementError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, StatementError
 from sqlalchemy.orm import sessionmaker
 
 from app import engine_models as em
@@ -631,7 +631,14 @@ class TestExit6MoneyShape:
                 currency="KUWAIT",
             )
         )
-        with pytest.raises(IntegrityError):
+        # The row is refused on both backends, but not by the same mechanism, so
+        # the exception CLASS differs. SQLite's CHAR(3) is advisory, so the
+        # `length(currency) = 3` CHECK is what fires (IntegrityError). PostgreSQL
+        # enforces CHAR(3) as a real width and rejects the value on the way in,
+        # before any constraint is evaluated (DataError /
+        # StringDataRightTruncation). Either way an over-long currency code
+        # cannot be stored, which is the invariant.
+        with pytest.raises((IntegrityError, DataError)):
             session.flush()
 
 

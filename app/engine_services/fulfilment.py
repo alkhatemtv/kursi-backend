@@ -46,6 +46,8 @@ from app.engine_services import clock
 from app.engine_services.audit import (
     ACTION_ORDER_COMPLETED,
     ACTION_TICKET_CANCELLED,
+    ACTION_TICKET_CHECKED_IN,
+    ACTION_TICKET_CREDENTIAL_ROTATED,
     ACTION_TICKET_ISSUED,
     ACTION_TICKET_REFUNDED,
     record_audit,
@@ -293,7 +295,13 @@ def _transition_ticket(
     *,
     actor_user_id: int | None,
     reason: str | None,
+    extra_values: dict[str, Any] | None = None,
+    extra_audit: dict[str, Any] | None = None,
 ) -> Ticket:
+    """The one ticket state machine. `extra_values` are columns that belong to a
+    particular edge - `checked_in_at` on check-in, say - written in the SAME
+    conditional UPDATE as the status, so they can never land on a row whose
+    transition someone else won."""
     ticket_id = _resolve_id(ticket)
 
     with unit_of_work(session):
@@ -321,7 +329,7 @@ def _transition_ticket(
         changed = session.execute(
             update(Ticket)
             .where(Ticket.id == ticket_id, Ticket.status == previous_status)
-            .values(status=target, updated_at=func.now())
+            .values(status=target, updated_at=func.now(), **(extra_values or {}))
             .execution_options(synchronize_session=False)
         )
         if (changed.rowcount or 0) != 1:  # pragma: no cover - concurrent change
@@ -347,6 +355,7 @@ def _transition_ticket(
                 # Said out loud because it is the surprising part: the seat goes
                 # back on sale, the usage row does not go away.
                 "usage_event_retained": True,
+                **(extra_audit or {}),
             },
         )
 
@@ -390,6 +399,137 @@ def refund_ticket(
         actor_user_id=actor_user_id,
         reason=reason,
     )
+
+
+def check_in_ticket(
+    session: Session,
+    ticket: Ticket | int,
+    *,
+    actor_user_id: int | None = None,
+    reason: str | None = None,
+) -> Ticket:
+    """issued -> checked_in, stamping who scanned it and when (spec 5).
+
+    THE DOOR IS A RACE
+    ------------------
+    Two scanners on two turnstiles can present the same QR in the same
+    millisecond, and exactly one of them must be told "valid". That is settled
+    here by the same conditional UPDATE every other transition uses - the second
+    scanner matches zero rows and gets `InvalidTicketTransition`, which the
+    check-in endpoint reports as the `already_checked_in` verdict. No lock, no
+    read-then-write window.
+
+    The verdict TABLE itself (valid / superseded / wrong_performance / ...) is
+    the API layer's job, as spec 5 says; this is only the state change it makes
+    when the verdict is `valid`.
+    """
+    return _transition_ticket(
+        session,
+        ticket,
+        "checked_in",
+        ACTION_TICKET_CHECKED_IN,
+        actor_user_id=actor_user_id,
+        reason=reason,
+        extra_values={
+            "checked_in_at": clock.now(session),
+            "checked_in_by_user_id": actor_user_id,
+        },
+    )
+
+
+@dataclass
+class RotationResult:
+    """`token` is the ONLY time the new credential exists in readable form."""
+
+    ticket_id: int
+    credential_version: int
+    token: str
+
+
+def rotate_credential(
+    session: Session,
+    ticket: Ticket | int,
+    *,
+    actor_user_id: int | None = None,
+    reason: str | None = None,
+) -> RotationResult:
+    """Reissue a ticket's QR without reissuing the ticket (Decision 4).
+
+    `credential_version` increments, a fresh token is signed and only its hash is
+    stored. `tickets.id`, `status`, the seat and the usage row are all untouched
+    - a customer who lost their phone gets a working QR back, and nothing about
+    the sale changes.
+
+    Every previously issued token for this ticket now carries a version that no
+    longer matches the row, which is exactly what makes `superseded` a
+    distinguishable scan verdict rather than a silent failure.
+
+    The version bump is a conditional UPDATE on the version we read, so two
+    simultaneous rotations cannot both claim the same new version: the loser
+    matches zero rows and is told to retry.
+    """
+    ticket_id = _resolve_id(ticket)
+
+    with unit_of_work(session):
+        current = session.get(Ticket, ticket_id)
+        if current is None:
+            raise NotFound(f"ticket {ticket_id} does not exist")
+        if current.status not in LIVE_TICKET_STATUSES:
+            raise InvalidTicketTransition(
+                f"ticket {ticket_id} is {current.status}; a credential is only "
+                f"rotated for a live ticket",
+                ticket_id=ticket_id,
+                status=current.status,
+            )
+
+        organization_id = current.organization_id
+        previous_version = current.credential_version
+        next_version = previous_version + 1
+        credential = issue_credential(ticket_id, next_version)
+        session.expire(current)
+
+        changed = session.execute(
+            update(Ticket)
+            .where(
+                Ticket.id == ticket_id,
+                Ticket.credential_version == previous_version,
+            )
+            .values(
+                credential_version=next_version,
+                credential_hash=credential.hash,
+                updated_at=func.now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if (changed.rowcount or 0) != 1:  # pragma: no cover - concurrent rotation
+            raise EngineConflict(
+                f"ticket {ticket_id} was rotated concurrently; retry",
+                ticket_id=ticket_id,
+            )
+
+        record_audit(
+            session,
+            organization_id=organization_id,
+            action=ACTION_TICKET_CREDENTIAL_ROTATED,
+            entity_type="ticket",
+            entity_id=ticket_id,
+            actor_user_id=actor_user_id,
+            data={
+                "from_version": previous_version,
+                "to_version": next_version,
+                "reason": reason,
+                # The token is never audited - only its version. An audit log
+                # that carried working credentials would defeat hashing them.
+            },
+        )
+
+        result = RotationResult(
+            ticket_id=ticket_id,
+            credential_version=next_version,
+            token=credential.token,
+        )
+
+    return result
 
 
 def order_tickets(session: Session, order: Order | int) -> list[Ticket]:

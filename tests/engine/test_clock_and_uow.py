@@ -36,9 +36,25 @@ class TestDatabaseClock:
 
         assert answer.tzinfo is not None
         assert answer.utcoffset() == timedelta(0)
-        # Same machine in the test harness, so it must sit between the two
-        # Python readings, give or take a second of clock granularity.
-        assert before - timedelta(seconds=2) <= answer <= after + timedelta(seconds=2)
+
+        if session.get_bind().dialect.name == "sqlite":
+            # The SQLite harness IS this machine, so the database's answer must
+            # sit between the two Python readings, give or take a second of
+            # clock granularity.
+            assert before - timedelta(seconds=2) <= answer <= after + timedelta(seconds=2)
+        else:
+            # A REMOTE PostgreSQL keeps its OWN clock, and the entire point of
+            # DatabaseClock is that the engine trusts that one rather than
+            # whichever machine happened to make the call - two web dynos with
+            # skewed wall clocks must still agree on when a hold expires.
+            # Demanding agreement with the local clock here would assert the
+            # opposite of the design. What is still worth checking is that the
+            # value is a plausible instant and not a timezone conversion gone
+            # wrong by hours.
+            assert abs(answer - before) < timedelta(hours=1), (
+                "the database clock is more than an hour from this machine's; "
+                "that is a real skew problem, not the expected small drift"
+            )
 
     def test_it_has_sub_second_resolution(self, session):
         """`CURRENT_TIMESTAMP` on SQLite is whole seconds - too coarse to reason

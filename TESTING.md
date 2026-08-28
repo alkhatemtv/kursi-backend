@@ -69,6 +69,48 @@ pytest
 The schema is dropped and recreated in that database, so it must be one you are
 happy to lose. The guards above still apply.
 
+### Running against a REMOTE Postgres (the staging server)
+
+Layer 3 refuses `rlwy.net` on sight, which is correct and is also a problem: the
+only PostgreSQL this project has is the one on Railway, and some tests — the
+concurrency races, the plpgsql freeze guard, `TEXT[]` — can run nowhere else.
+Refusing outright would mean they never run at all.
+
+So there is exactly one way past layer 3, and it is deliberately awkward:
+
+```bash
+export ALLOW_REMOTE_TEST_DATABASE=i-understand-this-drops-tables
+export TEST_DATABASE_URL=postgresql://user:pass@host.proxy.rlwy.net:PORT/kursi_scratch_1c
+pytest
+```
+
+Both of these must hold, or the run still stops before touching anything:
+
+1. `ALLOW_REMOTE_TEST_DATABASE` is the **exact** phrase above. Not a truthy
+   value — a phrase nobody exports by accident or leaves in a shell profile
+   without noticing.
+2. **The database must not be named `railway`.** That is the name Railway gives
+   the database it provisions for a service, in *every* environment. So the
+   escape hatch can only ever be aimed at a scratch database somebody created on
+   purpose — never at production's, and never at staging's own. Create one first:
+
+   ```sql
+   CREATE DATABASE kursi_scratch_1c;   -- on the staging server, once
+   ```
+
+The run prints the host and database it resolved before creating a single table,
+so a mistake is visible in the output rather than discovered afterwards.
+
+Two operational notes for a staging run:
+
+- **Turn Public Access back off afterwards.** The staging Postgres needs a TCP
+  proxy for the duration (`railway tcp-proxy create --service Postgres
+  --environment staging --port 5432`); delete it when the run is done.
+- **Expect it to be slow.** Every statement is a round trip over the public
+  internet. The per-test wipe is one `TRUNCATE ... CASCADE` on PostgreSQL rather
+  than the twenty-two `DELETE`s SQLite uses, which is what makes the full suite
+  finishable at all over a WAN link.
+
 ---
 
 ## Fixtures (`tests/conftest.py`)
@@ -211,6 +253,44 @@ pytest tests/engine
 
 > The package runs `alembic downgrade base` then `upgrade head` on that URL, so it must
 > be a scratch database. The `conftest.py` guards still refuse any live-looking host.
+
+---
+
+## API route tests (Phase 1c)
+
+`tests/engine/test_api_auth.py` and `tests/engine/test_api_v1.py` cover the `/v1`
+HTTP surface. **They live in `tests/engine/` on purpose**: two of the things a
+route test has to assert are enforced by the database and by nothing else — the
+frozen-layout trigger behind `409 layout_frozen`, and the partial unique indexes
+behind the seat conflicts — and only that package builds its database with
+`alembic upgrade head`. A route test on a `create_all()` database would be
+asserting against a schema production does not have.
+
+The seam is `app.database.get_db`. The `api_client` fixture overrides it so every
+request runs on the migrated engine, which also means the autouse `ManualClock`
+governs route tests too: an eight-minute hold is exercised in milliseconds,
+through the same code path production uses, with no `sleep` anywhere.
+
+Three fixtures do the setup:
+
+| Fixture | What it gives you |
+|---|---|
+| `api_client` | `TestClient` bound to the migrated database, with Auth0 patched |
+| `api_world` | `world` plus one user per **spec-1 role**, each with an active membership, an *invited* (non-authorising) membership, and a second organization with its own owner for cross-tenant assertions |
+| `make_api_key` | mints a real key row and hands back the token, exactly as the endpoint does |
+
+`role_header("box_office")` and `key_header(token)` build the `Authorization`
+header for either credential kind.
+
+What is covered: the auth matrix (no credential / unverifiable / other org /
+wrong role / right role, and read-vs-write scope for API keys), key
+create-list-revoke, the seat-map shape and its single-query guarantee, the
+checkout happy path and the verbatim 409 conflict payload, extend/release/
+complete, every check-in verdict, the frozen-layout 409, integer-minor-unit
+rejection, and — asserted explicitly — that the `/v1` error handlers leave legacy
+responses in FastAPI's `{"detail": ...}` shape.
+
+---
 
 ### The legacy suites now clear Engine tables too
 

@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 
+from app.api import v1 as api_v1
+from app.api.errors import install_error_handlers
 from app.config import settings
 from app.database import Base, engine
 from app.migrations import check_migration_state, get_app_version, log_migration_state
@@ -67,12 +69,81 @@ async def lifespan(app: FastAPI):
     yield
 
 
+#: The blurb at the top of the generated docs. This is the first thing an
+#: integrator reads, so it carries the two conventions that break clients when
+#: they are guessed wrong: money and time.
+API_DESCRIPTION = """
+Backend for the Kursi.io event ticketing platform.
+
+## Two APIs live here
+
+* **`/v1/…` — the Kursi Engine.** The versioned, documented API: organizations,
+  venues, seating layouts, events, performances, seat maps, checkout, tickets
+  and check-in. Everything below is about this one.
+* **everything else** — the original marketplace endpoints, frozen. They are
+  unversioned, are not part of the public contract, and will not change.
+
+## Authentication
+
+Every `/v1` endpoint takes `Authorization: Bearer <credential>`, where the
+credential is either an **Auth0 access token** (a person, acting through the
+dashboard) or an **API key** (a machine, acting for one organization). They are
+told apart by prefix — an API key starts `ksk_live_` (production) or `ksk_test_`
+(sandbox). Each endpoint states which it accepts and what role or scope it
+needs.
+
+`GET /v1/me` is where a client starts: it returns the organizations you may act
+for, and their ids are what the rest of the paths are built from.
+
+## Money is always integer minor units
+
+Every monetary field is named `*_minor` and is an **integer** count of the
+currency's smallest unit, alongside a 3-letter ISO `currency`:
+
+| currency | minor digits | `amount_minor` | means |
+|---|---|---|---|
+| KWD | 3 | `25000` | KWD 25.000 |
+| KWD | 3 | `5500` | KWD 5.500 |
+| USD | 2 | `1299` | USD 12.99 |
+
+**Decimals and floats are rejected with 422.** `25.0` is not 25 dinars, and
+accepting it would mean silently rounding somebody's revenue. Convert
+explicitly before you send.
+
+## Time is always UTC
+
+Every timestamp is ISO-8601 with an explicit `+00:00` offset, and every deadline
+in this API — a hold's `expires_at` above all — is judged by comparing
+timestamps against the database's own clock. Nothing sweeps; a hold is dead the
+microsecond it passes.
+
+## Errors
+
+Every `/v1` failure has the same shape:
+
+```json
+{"error": "seats_unavailable", "message": "seats unavailable: A-12", "detail": {}}
+```
+
+`error` is a stable machine string and is the thing to branch on; `message` is
+for humans and may be reworded. Seat conflicts additionally carry a `conflicts`
+array with one entry per offending seat — see
+`POST /v1/performances/{id}/orders`.
+"""
+
 app = FastAPI(
     title="Kursi.io API",
-    description="Backend for the Kursi.io event ticketing platform.",
+    description=API_DESCRIPTION,
     version="0.1.0",
     lifespan=lifespan,
+    openapi_tags=api_v1.OPENAPI_TAGS,
 )
+
+# /v1 error envelope. Registered app-wide because FastAPI has no per-router
+# exception handlers - every handler checks the request path and hands anything
+# that is not /v1 straight back to FastAPI's default, so the frozen marketplace
+# responses are unchanged. See app/api/errors.py.
+install_error_handlers(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,6 +179,8 @@ def root():
 def health():
     return _health_payload()
 
+
+app.include_router(api_v1.router)
 
 app.include_router(users.router)
 app.include_router(events.router)

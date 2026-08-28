@@ -40,6 +40,62 @@ _FORBIDDEN_URL_MARKERS = (
     "neon.tech",
 )
 
+# ── The one way past layer 3 ────────────────────────────────────────────────
+# Some tests can only run on real PostgreSQL - the concurrency races, the
+# plpgsql freeze guard, TEXT[] - and the only PostgreSQL this project has is on
+# Railway, behind a host layer 3 refuses on sight. Refusing outright would mean
+# those tests never run anywhere, which is worse than the risk being guarded
+# against; refusing quietly would be worse still.
+#
+# So there is exactly one deliberate way through, and it is loud:
+#
+#   1. `ALLOW_REMOTE_TEST_DATABASE` must be set to the exact phrase below. A
+#      value nobody types by accident, and nothing that could be exported once
+#      and forgotten in a shell profile without being noticed.
+#   2. The target database must NOT be called `railway`. That is the name
+#      Railway gives the database it provisions for a service, in EVERY
+#      environment - so this rule means the escape hatch can only ever point at
+#      a scratch database somebody created on purpose. Aiming it at production,
+#      or at staging's own database, is still refused.
+#   3. The host and database are printed before a single table is created, so a
+#      mistake is visible in the test output rather than discovered afterwards.
+#
+# `alembic downgrade base` runs against whatever this resolves to. Treat it as
+# a database you are willing to lose, because that is what it becomes.
+_REMOTE_OPT_IN_ENV = "ALLOW_REMOTE_TEST_DATABASE"
+_REMOTE_OPT_IN_PHRASE = "i-understand-this-drops-tables"
+_RESERVED_DB_NAMES = ("railway",)
+
+
+def _remote_opt_in_granted(url: str) -> bool:
+    """Is the loud, deliberate opt-in present AND aimed somewhere disposable?"""
+    if os.environ.get(_REMOTE_OPT_IN_ENV, "").strip() != _REMOTE_OPT_IN_PHRASE:
+        return False
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    database = (parsed.path or "").lstrip("/").split("?")[0]
+    if database.lower() in _RESERVED_DB_NAMES:
+        raise RuntimeError(
+            f"REFUSING TO RUN TESTS: {_REMOTE_OPT_IN_ENV} is set, but the target "
+            f"database is named {database!r} - the name Railway gives the "
+            f"database it provisions for a service, in every environment. The "
+            f"suite DROPS AND RECREATES every table it touches. Create a scratch "
+            f"database on that server (e.g. `kursi_scratch`) and point "
+            f"TEST_DATABASE_URL at that instead."
+        )
+    banner = [
+        "==============================================================================",
+        "  REMOTE TEST DATABASE IN USE - tables will be DROPPED and recreated",
+        f"    host     {parsed.hostname}:{parsed.port}",
+        f"    database {database}",
+        "==============================================================================",
+    ]
+    print(("\n".join(banner)), flush=True)
+    return True
+
+
 TEST_DB_FILE = ROOT / "test_kursi_suite.db"
 
 
@@ -60,14 +116,16 @@ def _resolve_test_database_url() -> str:
 
     lowered = url.lower()
 
-    for marker in _FORBIDDEN_URL_MARKERS:
-        if marker in lowered:
-            raise RuntimeError(
-                f"REFUSING TO RUN TESTS: the resolved test database URL points at "
-                f"what looks like a live database (matched {marker!r}). "
-                f"Tests must never run against production. "
-                f"Unset TEST_DATABASE_URL to use the default throwaway SQLite file."
-            )
+    matched = next((m for m in _FORBIDDEN_URL_MARKERS if m in lowered), None)
+    if matched and not _remote_opt_in_granted(url):
+        raise RuntimeError(
+            f"REFUSING TO RUN TESTS: the resolved test database URL points at "
+            f"what looks like a live database (matched {matched!r}). "
+            f"Tests must never run against production. "
+            f"Unset TEST_DATABASE_URL to use the default throwaway SQLite file, "
+            f"or see the {_REMOTE_OPT_IN_ENV} contract in this file if you "
+            f"genuinely need a remote scratch database."
+        )
 
     if not lowered.startswith("sqlite"):
         # A non-SQLite URL is allowed, but only when it was requested deliberately.
@@ -92,6 +150,7 @@ os.environ["AUTH0_NAMESPACE"] = "https://kursi.io/"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import text as sa_text  # noqa: E402
 
 from app import auth  # noqa: E402
 from app import engine_models as em  # noqa: E402
@@ -157,11 +216,22 @@ def db():
     `_ENGINE_WIPE_ORDER`.
     """
     session = SessionLocal()
-    for model in _ENGINE_WIPE_ORDER:
-        session.query(model).delete()
-    for model in (Wishlist, Refund, Booking, Event, User):
-        session.query(model).delete()
-    session.commit()
+    if engine.dialect.name == "postgresql":
+        # One statement instead of twenty-two. See the same note in
+        # tests/engine/conftest.py: this suite is also run against a remote
+        # PostgreSQL over a public proxy, where each statement is a round trip.
+        tables = ", ".join(
+            [m.__tablename__ for m in _ENGINE_WIPE_ORDER]
+            + [m.__tablename__ for m in (Wishlist, Refund, Booking, Event, User)]
+        )
+        session.execute(sa_text(f"TRUNCATE TABLE {tables} CASCADE"))
+        session.commit()
+    else:
+        for model in _ENGINE_WIPE_ORDER:
+            session.query(model).delete()
+        for model in (Wishlist, Refund, Booking, Event, User):
+            session.query(model).delete()
+        session.commit()
     try:
         yield session
     finally:

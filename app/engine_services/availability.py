@@ -29,6 +29,7 @@ produce by accident.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import Select, and_, select
 from sqlalchemy.orm import Session, aliased
@@ -273,3 +274,89 @@ def describe_unavailable(
                 )
             )
     return conflicts
+
+
+# ── The seat map, as a client sees it ───────────────────────────────────────
+#: What a seat looks like from outside. Four values, because a buyer only ever
+#: needs to know "can I have it, and if not, is it coming back": `held` may free
+#: itself the moment a hold expires, `sold` and `blocked` will not.
+PUBLIC_AVAILABLE = "available"
+PUBLIC_HELD = "held"
+PUBLIC_SOLD = "sold"
+PUBLIC_BLOCKED = "blocked"
+PUBLIC_SEAT_STATUSES = (
+    PUBLIC_AVAILABLE,
+    PUBLIC_HELD,
+    PUBLIC_SOLD,
+    PUBLIC_BLOCKED,
+)
+
+
+def seat_availability_rows(
+    session: Session, performance_id: int, now: datetime
+) -> list[Any]:
+    """Every seat of a performance with its public status, in ONE query.
+
+    `describe_unavailable` answers "why not these seats"; this answers "what does
+    the whole house look like", which is what a seat-map renderer needs. Both are
+    the same predicate - the two correlated subqueries below are the very ones
+    `seat_is_available_expr` is built from - so a seat can never be drawn as free
+    here and refused by the locking engine a moment later.
+
+    ONE PASS, NOT N+1
+    -----------------
+    The lock holder and the live ticket arrive as correlated scalar subqueries in
+    the SELECT list, so a 144-seat house is one statement and a 5,000-seat arena
+    is still one statement. Fetching seats and then asking per seat whether it is
+    locked or sold would be the obvious shape and would issue thousands of
+    queries per seat-map render.
+
+    Returns SQLAlchemy rows carrying the inventory columns plus `public_status`;
+    the HTTP layer shapes them, and nothing here imports a serialisation format.
+    """
+    holder, holder_expiry = _blocking_lock_columns(now, exclude_order_id=None)
+    ticket_id, ticket_status = _blocking_ticket_columns()
+
+    return list(
+        session.execute(
+            select(
+                PerformanceSeat.id,
+                PerformanceSeat.seat_uid,
+                PerformanceSeat.section,
+                PerformanceSeat.row_label,
+                PerformanceSeat.seat_number,
+                PerformanceSeat.label,
+                PerformanceSeat.x,
+                PerformanceSeat.y,
+                PerformanceSeat.category_key,
+                PerformanceSeat.status,
+                PerformanceSeat.accessibility,
+                PerformanceSeat.price_override_minor,
+                PerformanceSeat.currency,
+                holder.label("holder_order_id"),
+                holder_expiry.label("holder_expires_at"),
+                ticket_id.label("ticket_id"),
+                ticket_status.label("ticket_status"),
+            )
+            .where(PerformanceSeat.performance_id == performance_id)
+            .order_by(PerformanceSeat.id)
+        ).all()
+    )
+
+
+def public_seat_status(row: Any) -> str:
+    """Map one `seat_availability_rows` row onto the four public values.
+
+    Precedence is identical to `describe_unavailable`'s - inventory status
+    first, then a live ticket, then an active lock - so the seat map and the
+    checkout rejection never disagree about WHY a seat is unavailable. A seat
+    that is both blocked and stale-locked reads as blocked in both places,
+    because releasing the lock would not make it sellable.
+    """
+    if row.status != SELLABLE_SEAT_STATUS:
+        return PUBLIC_BLOCKED
+    if row.ticket_id is not None:
+        return PUBLIC_SOLD
+    if row.holder_order_id is not None:
+        return PUBLIC_HELD
+    return PUBLIC_AVAILABLE

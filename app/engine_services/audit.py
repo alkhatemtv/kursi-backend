@@ -27,6 +27,8 @@ ACTION_ORDER_CANCELLED = "order.cancelled"
 ACTION_ORDER_COMPLETED = "order.completed"
 ACTION_ORDER_EXPIRED = "order.expired"
 ACTION_TICKET_ISSUED = "ticket.issued"
+ACTION_TICKET_CHECKED_IN = "ticket.checked_in"
+ACTION_TICKET_CREDENTIAL_ROTATED = "ticket.credential_rotated"
 ACTION_TICKET_CANCELLED = "ticket.cancelled"
 ACTION_TICKET_REFUNDED = "ticket.refunded"
 

@@ -25,10 +25,13 @@ reasoning for the whole checkout path.
 from app.engine_services.availability import (  # noqa: F401
     LIVE_ORDER_STATUSES,
     LIVE_TICKET_STATUSES,
+    PUBLIC_SEAT_STATUSES,
     SELLABLE_SEAT_STATUS,
     available_seat_uids,
     describe_unavailable,
     is_seat_available,
+    public_seat_status,
+    seat_availability_rows,
     seat_is_available_expr,
 )
 from app.engine_services.clock import (  # noqa: F401
@@ -62,11 +65,14 @@ from app.engine_services.errors import (  # noqa: F401
 )
 from app.engine_services.fulfilment import (  # noqa: F401
     CompletionResult,
+    RotationResult,
     cancel_ticket,
+    check_in_ticket,
     complete_order,
     live_ticket_for_seat,
     order_tickets,
     refund_ticket,
+    rotate_credential,
 )
 from app.engine_services.layout import (  # noqa: F401
     LayoutCategory,
@@ -122,9 +128,11 @@ __all__ = [
     "ManualClock",
     "NotFound",
     "OrderNotLive",
+    "PUBLIC_SEAT_STATUSES",
     "ParsedLayout",
     "PricingUnavailable",
     "PublishResult",
+    "RotationResult",
     "SELLABLE_SEAT_STATUS",
     "SeatConflict",
     "SeatsUnavailable",
@@ -132,6 +140,7 @@ __all__ = [
     "as_utc",
     "available_seat_uids",
     "cancel_ticket",
+    "check_in_ticket",
     "complete_order",
     "create_draft_order",
     "credential_hash",
@@ -149,9 +158,12 @@ __all__ = [
     "parse_layout",
     "personal_org_slug",
     "price_for_seat",
+    "public_seat_status",
     "publish_performance",
     "refund_ticket",
     "release_order",
+    "rotate_credential",
+    "seat_availability_rows",
     "seat_is_available_expr",
     "set_clock",
     "slugify",
